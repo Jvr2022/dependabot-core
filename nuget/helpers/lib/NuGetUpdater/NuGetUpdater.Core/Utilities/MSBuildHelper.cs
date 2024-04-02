@@ -67,62 +67,6 @@ internal static partial class MSBuildHelper
         }
     }
 
-    public static string[] GetTargetFrameworkMonikers(ImmutableArray<ProjectBuildFile> buildFiles)
-    {
-        HashSet<string> targetFrameworkValues = new(StringComparer.OrdinalIgnoreCase);
-        Dictionary<string, string> propertyInfo = new(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var buildFile in buildFiles)
-        {
-            var projectRoot = CreateProjectRootElement(buildFile);
-
-            foreach (var property in projectRoot.Properties)
-            {
-                if (property.Name.Equals("TargetFramework", StringComparison.OrdinalIgnoreCase) ||
-                    property.Name.Equals("TargetFrameworks", StringComparison.OrdinalIgnoreCase))
-                {
-                    foreach (var tfm in property.Value.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-                    {
-                        targetFrameworkValues.Add(tfm);
-                    }
-                }
-                else if (property.Name.Equals("TargetFrameworkVersion", StringComparison.OrdinalIgnoreCase))
-                {
-                    // For packages.config projects that use TargetFrameworkVersion, we need to convert it to TargetFramework
-                    targetFrameworkValues.Add($"net{property.Value.TrimStart('v').Replace(".", "")}");
-                }
-                else
-                {
-                    propertyInfo[property.Name] = property.Value;
-                }
-            }
-        }
-
-        HashSet<string> targetFrameworks = new(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var targetFrameworkValue in targetFrameworkValues)
-        {
-            var (resultType, tfms, errorMessage) =
-                GetEvaluatedValue(targetFrameworkValue, propertyInfo, propertiesToIgnore: ["TargetFramework", "TargetFrameworks"]);
-            if (resultType != EvaluationResultType.Success)
-            {
-                continue;
-            }
-
-            if (string.IsNullOrEmpty(tfms))
-            {
-                continue;
-            }
-
-            foreach (var tfm in tfms.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                targetFrameworks.Add(tfm);
-            }
-        }
-
-        return targetFrameworks.ToArray();
-    }
-
     public static IEnumerable<string> GetProjectPathsFromSolution(string solutionPath)
     {
         var solution = SolutionFile.Parse(solutionPath);
@@ -509,7 +453,7 @@ internal static partial class MSBuildHelper
         return PathHelper.GetFileInDirectoryOrParent(Path.GetDirectoryName(projectPath)!, repoRootPath, "global.json");
     }
 
-    internal static async Task<ImmutableArray<ProjectBuildFile>> LoadBuildFiles(string repoRootPath, string projectPath)
+    internal static async Task<(ImmutableArray<ProjectBuildFile>, string[])> LoadBuildFilesAndTargetFrameworks(string repoRootPath, string projectPath)
     {
         var buildFileList = new List<string>
         {
@@ -519,6 +463,7 @@ internal static partial class MSBuildHelper
         // a global.json file might cause problems with the dotnet msbuild command; create a safe version temporarily
         var globalJsonPath = GetGlobalJsonPath(repoRootPath, projectPath);
         var safeGlobalJsonName = $"{globalJsonPath}{Guid.NewGuid()}";
+        var targetFrameworks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         try
         {
@@ -553,10 +498,38 @@ internal static partial class MSBuildHelper
                 ProjectCollection = projectCollection,
             });
             buildFileList.AddRange(project.Imports.Select(i => i.ImportedProject.FullPath.NormalizePathToUnix()));
+
+            // use the MSBuild-evaluated value so we don't have to recreate anything
+            var targetFrameworkProperties = project.Properties.Where(p => p.Name.Equals("TargetFramework", StringComparison.OrdinalIgnoreCase)).ToList();
+            var targetFrameworksProperties = project.Properties.Where(p => p.Name.Equals("TargetFrameworks", StringComparison.OrdinalIgnoreCase)).ToList();
+            var targetFrameworkVersionProperties = project.Properties.Where(p => p.Name.Equals("TargetFrameworkVersion", StringComparison.OrdinalIgnoreCase)).ToList();
+            foreach (var tfm in targetFrameworkProperties)
+            {
+                targetFrameworks.Add(tfm.EvaluatedValue);
+            }
+
+            foreach (var tfms in targetFrameworksProperties)
+            {
+                foreach (var tfmValue in tfms.EvaluatedValue.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    targetFrameworks.Add(tfmValue);
+                }
+            }
+
+            if (!targetFrameworks.Any())
+            {
+                // Only try this if we haven't been able to resolve anything yet.  This is because deep in the SDK, a
+                // `TargetFramework` of `netstandard2.0` (eventually) gets turned into `v2.0` and we don't want to
+                // interpret that as a .NET Framework 2.0 project.
+                foreach (var tfvm in targetFrameworkVersionProperties)
+                {
+                    targetFrameworks.Add($"net{tfvm.EvaluatedValue.TrimStart('v').Replace(".", "")}");
+                }
+            }
         }
         catch (InvalidProjectFileException)
         {
-            return [];
+            return ([], []);
         }
         finally
         {
@@ -575,7 +548,7 @@ internal static partial class MSBuildHelper
         var result = buildFilesInRepo
             .Select(path => ProjectBuildFile.Open(repoRootPath, path))
             .ToImmutableArray();
-        return result;
+        return (result, targetFrameworks.ToArray());
     }
 
     [GeneratedRegex("^\\s*NuGetData::Package=(?<PackageName>[^,]+), Version=(?<PackageVersion>.+)$")]
